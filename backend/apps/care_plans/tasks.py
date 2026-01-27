@@ -8,8 +8,17 @@ from datetime import datetime
 import structlog
 from celery import shared_task
 from django.conf import settings
-from prometheus_client import Counter, Histogram
 
+from apps.core.metrics import (
+    CARE_PLAN_GENERATION_TOTAL,
+    CARE_PLAN_GENERATION_DURATION_SECONDS,
+    CARE_PLAN_QUEUE_SIZE,
+    CARE_PLAN_RETRY_TOTAL,
+    LLM_REQUEST_TOTAL,
+    LLM_REQUEST_DURATION_SECONDS,
+    LLM_TOKENS_USED_TOTAL,
+    record_llm_cost,
+)
 from apps.orders.models import Order
 
 from .llm_service import get_llm_service
@@ -18,27 +27,6 @@ from .prompts import build_care_plan_prompt
 from .skeleton_analyzer import get_dynamic_skeleton, build_dynamic_system_prompt
 
 logger = structlog.get_logger(__name__)
-
-# Prometheus metrics for care plan generation
-CARE_PLAN_GENERATION_TOTAL = Counter(
-    "care_plan_generation_total",
-    "Total care plan generation attempts",
-    ["status"],  # success, error, already_exists, order_not_found
-)
-CARE_PLAN_GENERATION_DURATION = Histogram(
-    "care_plan_generation_duration_seconds",
-    "Time spent generating care plans",
-    buckets=[1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0],
-)
-LLM_TOKENS_USED = Counter(
-    "llm_tokens_used_total",
-    "Total LLM tokens used",
-    ["type"],  # prompt, completion
-)
-CARE_PLAN_RETRY_TOTAL = Counter(
-    "care_plan_retry_total",
-    "Care plan generation retries",
-)
 
 
 @shared_task(
@@ -168,14 +156,33 @@ def generate_care_plan(self, order_id: str):
         )
 
         # Generate with LLM using dynamic system prompt
-        response = llm_service.generate(
-            prompt=prompt,
-            system_prompt=system_prompt,
-        )
+        llm_start_time = time.time()
+        llm_provider = settings.LLM_PROVIDER.lower()
+
+        try:
+            response = llm_service.generate(
+                prompt=prompt,
+                system_prompt=system_prompt,
+            )
+            LLM_REQUEST_TOTAL.labels(provider=llm_provider, status="success").inc()
+        except Exception as llm_error:
+            LLM_REQUEST_TOTAL.labels(provider=llm_provider, status="error").inc()
+            raise llm_error
+        finally:
+            llm_duration = time.time() - llm_start_time
+            LLM_REQUEST_DURATION_SECONDS.labels(provider=llm_provider).observe(llm_duration)
 
         # Record LLM token metrics
-        LLM_TOKENS_USED.labels(type="prompt").inc(response.prompt_tokens)
-        LLM_TOKENS_USED.labels(type="completion").inc(response.completion_tokens)
+        LLM_TOKENS_USED_TOTAL.labels(provider=llm_provider, token_type="prompt").inc(response.prompt_tokens)
+        LLM_TOKENS_USED_TOTAL.labels(provider=llm_provider, token_type="completion").inc(response.completion_tokens)
+
+        # Record LLM cost
+        record_llm_cost(
+            provider=llm_provider,
+            model=response.model,
+            prompt_tokens=response.prompt_tokens,
+            completion_tokens=response.completion_tokens,
+        )
 
         logger.info(
             "llm_generation_completed",
@@ -216,8 +223,12 @@ def generate_care_plan(self, order_id: str):
 
         # Record success metrics
         duration = time.time() - start_time
-        CARE_PLAN_GENERATION_DURATION.observe(duration)
+        CARE_PLAN_GENERATION_DURATION_SECONDS.observe(duration)
         CARE_PLAN_GENERATION_TOTAL.labels(status="success").inc()
+
+        # Update queue size gauge
+        pending_count = Order.objects.filter(status__in=["pending", "processing"]).count()
+        CARE_PLAN_QUEUE_SIZE.set(pending_count)
 
         logger.info(
             "care_plan_generation_success",
@@ -225,6 +236,7 @@ def generate_care_plan(self, order_id: str):
             care_plan_id=str(care_plan.id),
             duration_seconds=round(duration, 2),
             total_tokens=response.total_tokens,
+            queue_remaining=pending_count,
         )
 
         return {
@@ -245,7 +257,7 @@ def generate_care_plan(self, order_id: str):
 
     except Exception as e:
         duration = time.time() - start_time
-        CARE_PLAN_GENERATION_DURATION.observe(duration)
+        CARE_PLAN_GENERATION_DURATION_SECONDS.observe(duration)
         CARE_PLAN_GENERATION_TOTAL.labels(status="error").inc()
 
         logger.error(
