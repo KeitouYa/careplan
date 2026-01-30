@@ -6,12 +6,18 @@ import time
 
 import structlog
 from django.db import transaction
-from prometheus_client import Counter, Histogram
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from apps.core.exceptions import DuplicateBlockedException, DuplicateWarningException
+from apps.core.metrics import (
+    ORDER_CREATED_TOTAL,
+    ORDER_CREATE_DURATION_SECONDS,
+    DUPLICATE_DETECTION_TOTAL,
+    CARE_PLAN_QUEUED_TOTAL,
+    CARE_PLAN_QUEUE_SIZE,
+)
 from apps.patients.models import MedicationHistory, Patient, PatientDiagnosis
 from apps.providers.models import Provider
 
@@ -26,28 +32,6 @@ from .services import DuplicateDetectionService, OrderDuplicateDetector
 
 # Structured logger
 logger = structlog.get_logger(__name__)
-
-# Prometheus metrics
-ORDER_CREATED_TOTAL = Counter(
-    "order_created_total",
-    "Total number of orders created",
-    ["status"],  # success, error, duplicate_blocked, duplicate_warning
-)
-ORDER_CREATE_DURATION = Histogram(
-    "order_create_duration_seconds",
-    "Time spent creating an order",
-    buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
-)
-DUPLICATE_DETECTION_TOTAL = Counter(
-    "duplicate_detection_total",
-    "Duplicate detection results",
-    ["type", "result"],  # type: patient/provider/order, result: exact_match/conflict/warning/none
-)
-CARE_PLAN_QUEUED_TOTAL = Counter(
-    "care_plan_queued_total",
-    "Care plan generation tasks queued",
-    ["status"],  # success, error
-)
 
 
 class OrderViewSet(viewsets.ModelViewSet):
@@ -198,7 +182,7 @@ class OrderViewSet(viewsets.ModelViewSet):
 
             # Record metrics
             duration = time.time() - start_time
-            ORDER_CREATE_DURATION.observe(duration)
+            ORDER_CREATE_DURATION_SECONDS.observe(duration)
             ORDER_CREATED_TOTAL.labels(status="success").inc()
 
             # Log success
@@ -237,7 +221,7 @@ class OrderViewSet(viewsets.ModelViewSet):
 
         except Exception as e:
             duration = time.time() - start_time
-            ORDER_CREATE_DURATION.observe(duration)
+            ORDER_CREATE_DURATION_SECONDS.observe(duration)
             ORDER_CREATED_TOTAL.labels(status="error").inc()
 
             logger.error(
@@ -254,29 +238,29 @@ class OrderViewSet(viewsets.ModelViewSet):
         # Patient duplicate detection
         if dup_result.patient_result:
             if dup_result.existing_patient:
-                DUPLICATE_DETECTION_TOTAL.labels(type="patient", result="exact_match").inc()
+                DUPLICATE_DETECTION_TOTAL.labels(entity_type="patient", result="exact_match").inc()
             elif dup_result.patient_result.warnings:
-                DUPLICATE_DETECTION_TOTAL.labels(type="patient", result="warning").inc()
+                DUPLICATE_DETECTION_TOTAL.labels(entity_type="patient", result="warning").inc()
             else:
-                DUPLICATE_DETECTION_TOTAL.labels(type="patient", result="none").inc()
+                DUPLICATE_DETECTION_TOTAL.labels(entity_type="patient", result="none").inc()
 
         # Provider duplicate detection
         if dup_result.provider_result:
             if dup_result.existing_provider:
-                DUPLICATE_DETECTION_TOTAL.labels(type="provider", result="exact_match").inc()
+                DUPLICATE_DETECTION_TOTAL.labels(entity_type="provider", result="exact_match").inc()
             elif dup_result.provider_result.warnings:
-                DUPLICATE_DETECTION_TOTAL.labels(type="provider", result="warning").inc()
+                DUPLICATE_DETECTION_TOTAL.labels(entity_type="provider", result="warning").inc()
             else:
-                DUPLICATE_DETECTION_TOTAL.labels(type="provider", result="none").inc()
+                DUPLICATE_DETECTION_TOTAL.labels(entity_type="provider", result="none").inc()
 
         # Order duplicate detection
         if dup_result.order_result:
             if dup_result.order_result.existing_record:
-                DUPLICATE_DETECTION_TOTAL.labels(type="order", result="conflict").inc()
+                DUPLICATE_DETECTION_TOTAL.labels(entity_type="order", result="conflict").inc()
             elif dup_result.order_result.warnings:
-                DUPLICATE_DETECTION_TOTAL.labels(type="order", result="warning").inc()
+                DUPLICATE_DETECTION_TOTAL.labels(entity_type="order", result="warning").inc()
             else:
-                DUPLICATE_DETECTION_TOTAL.labels(type="order", result="none").inc()
+                DUPLICATE_DETECTION_TOTAL.labels(entity_type="order", result="none").inc()
     
     @transaction.atomic
     def _create_order(self, data: dict, dup_result) -> Order:
@@ -373,10 +357,16 @@ class OrderViewSet(viewsets.ModelViewSet):
             from apps.care_plans.tasks import generate_care_plan
             generate_care_plan.delay(str(order.id))
             CARE_PLAN_QUEUED_TOTAL.labels(status="success").inc()
+
+            # Update queue size gauge (count pending orders)
+            pending_count = Order.objects.filter(status__in=["pending", "processing"]).count()
+            CARE_PLAN_QUEUE_SIZE.set(pending_count)
+
             logger.info(
                 "care_plan_queued",
                 order_id=str(order.id),
                 medication=order.medication_name,
+                queue_size=pending_count,
             )
         except Exception as e:
             CARE_PLAN_QUEUED_TOTAL.labels(status="error").inc()
